@@ -5,13 +5,17 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.PDSignature;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureInterface;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureOptions;
-import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.cms.CMSObjectIdentifiers;
 import org.bouncycastle.cert.jcajce.JcaCertStore;
-import org.bouncycastle.cms.*;
+import org.bouncycastle.cms.CMSException;
+import org.bouncycastle.cms.CMSSignedData;
+import org.bouncycastle.cms.CMSSignedDataGenerator;
+import org.bouncycastle.cms.CMSTypedData;
 import org.bouncycastle.cms.jcajce.JcaSignerInfoGeneratorBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.ContentSigner;
-import org.bouncycastle.operator.DefaultSignatureAlgorithmIdentifierFinder;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,8 +24,8 @@ import org.springframework.stereotype.Service;
 import java.io.*;
 import java.security.*;
 import java.security.cert.X509Certificate;
+import java.util.Arrays;
 import java.util.Calendar;
-import java.util.Collections;
 
 @Service
 public class PdfSigningService {
@@ -82,40 +86,61 @@ public class PdfSigningService {
         @Override
         public byte[] sign(InputStream content) throws IOException {
             try {
-                ByteArrayOutputStream buf = new ByteArrayOutputStream();
-                byte[] tmp = new byte[8192];
-                int n;
-                while ((n = content.read(tmp)) != -1) buf.write(tmp, 0, n);
-                byte[] data = buf.toByteArray();
+                // 1. Let Bouncy Castle build a ContentSigner backed directly by your PKCS#11 Token
+                ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA")
+                        .setProvider(pkcs11Prov)
+                        .build(pk);
 
-                // Sign with PKCS#11
-                Signature tokenSigner = Signature.getInstance("SHA256withRSA", pkcs11Prov);
-                tokenSigner.initSign(pk);
-                tokenSigner.update(data);
-                byte[] signatureValue = tokenSigner.sign();
-
-                // Build CMS
-                AlgorithmIdentifier sigAlgId = new DefaultSignatureAlgorithmIdentifierFinder()
-                        .find("SHA256withRSA");
-                ContentSigner contentSigner = new ContentSigner() {
-                    private final ByteArrayOutputStream os = new ByteArrayOutputStream();
-                    @Override
-                    public AlgorithmIdentifier getAlgorithmIdentifier() { return sigAlgId; }
-                    @Override
-                    public OutputStream getOutputStream() { return os; }
-                    @Override
-                    public byte[] getSignature() { return signatureValue; }
-                };
-
+                // 2. Initialize the CMS generator
                 CMSSignedDataGenerator gen = new CMSSignedDataGenerator();
                 gen.addSignerInfoGenerator(new JcaSignerInfoGeneratorBuilder(
                         new JcaDigestCalculatorProviderBuilder().setProvider("BC").build()
                 ).build(contentSigner, chain[0]));
-                gen.addCertificates(new JcaCertStore(Collections.singletonList(chain[0])));
-                return gen.generate(new CMSProcessableByteArray(data), false).getEncoded();
+                
+                gen.addCertificates(new JcaCertStore(Arrays.asList(chain)));
+
+                // 3. Process the stream contents directly without allocating massive memory arrays
+                CMSProcessableInputStream msg = new CMSProcessableInputStream(content);
+                
+                // 4. Generate the detached signature block (encapsulate = false)
+                CMSSignedData signedData = gen.generate(msg, false);
+                return signedData.getEncoded();
+                
             } catch (Exception e) {
+                log.error("Cryptographic signing processing failed", e);
                 throw new IOException("Sign failed: " + e.getMessage(), e);
             }
+        }
+    }
+
+    /**
+     * Efficient helper to pipe PDF byte ranges into BouncyCastle's hashing blocks
+     * without duplicating content ranges in memory.
+     */
+    private static class CMSProcessableInputStream implements CMSTypedData {
+        private final InputStream in;
+
+        public CMSProcessableInputStream(InputStream in) {
+            this.in = in;
+        }
+
+        @Override
+        public ASN1ObjectIdentifier getContentType() {
+            return CMSObjectIdentifiers.data;
+        }
+
+        @Override
+        public void write(OutputStream out) throws IOException, CMSException {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+        }
+
+        @Override
+        public Object getContent() {
+            return in;
         }
     }
 }

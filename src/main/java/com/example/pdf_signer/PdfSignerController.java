@@ -42,4 +42,9 @@ public class PdfSignerController {
             return ResponseEntity.internalServerError().body("{\"error\":\"" + e.getMessage() + "\"}");
         }
     }
+
+    @GetMapping("/health")
+    public ResponseEntity<String> health() {
+        return ResponseEntity.ok("OK - Service is running");
+    }
 }
