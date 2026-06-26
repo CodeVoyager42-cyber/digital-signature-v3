@@ -2,30 +2,28 @@ package com.example.pdf_signer;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.pdmodel.interactive.digitalsignature.PDSignature;
-import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureInterface;
-import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureOptions;
-import org.bouncycastle.asn1.ASN1ObjectIdentifier;
-import org.bouncycastle.asn1.cms.CMSObjectIdentifiers;
+import org.apache.pdfbox.pdmodel.interactive.digitalsignature.*;
+import org.bouncycastle.asn1.*;
+import org.bouncycastle.asn1.cms.Attribute;
+import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.cert.jcajce.JcaCertStore;
-import org.bouncycastle.cms.CMSException;
-import org.bouncycastle.cms.CMSSignedData;
-import org.bouncycastle.cms.CMSSignedDataGenerator;
-import org.bouncycastle.cms.CMSTypedData;
+import org.bouncycastle.cms.*;
 import org.bouncycastle.cms.jcajce.JcaSignerInfoGeneratorBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
+import org.bouncycastle.tsp.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.*;
+import java.math.BigInteger;
+import java.net.*;
 import java.security.*;
-import java.security.cert.X509Certificate;
-import java.util.Arrays;
-import java.util.Calendar;
+import java.security.cert.*;
+import java.util.*;
 
 @Service
 public class PdfSigningService {
@@ -33,9 +31,19 @@ public class PdfSigningService {
     private static final Logger log = LoggerFactory.getLogger(PdfSigningService.class);
     private final Pkcs11Config pkcs11Config;
 
-    static {
-        Security.addProvider(new BouncyCastleProvider());
-    }
+    private static final String SIGNER_NAME = "Mouad EL BAHRAOUI";
+    private static final String SIGNER_REASON = "Document Officiel";
+    private static final String SIGNER_LOCATION = "Rabat, Morocco";
+
+    private static final String[] TSA_SERVERS = {
+        "http://timestamp.digicert.com",
+        "http://timestamp.sectigo.com",
+        "http://tsa.starfieldtech.com"
+    };
+
+    private static final int TSA_TIMEOUT_MS = 10000;
+
+    static { Security.addProvider(new BouncyCastleProvider()); }
 
     public PdfSigningService(Pkcs11Config pkcs11Config) {
         this.pkcs11Config = pkcs11Config;
@@ -46,25 +54,32 @@ public class PdfSigningService {
         String alias = keyStore.aliases().nextElement();
         KeyStore.PrivateKeyEntry entry = (KeyStore.PrivateKeyEntry) keyStore.getEntry(
                 alias, new KeyStore.PasswordProtection(pkcs11Config.getPin().toCharArray()));
-        
-        PrivateKey pk = entry.getPrivateKey();
-        X509Certificate cert = (X509Certificate) entry.getCertificate();
-        X509Certificate[] chain = new X509Certificate[]{cert};
 
+        PrivateKey pk = entry.getPrivateKey();
+        X509Certificate signerCert = (X509Certificate) entry.getCertificate();
+
+        List<X509Certificate> chainList = new ArrayList<>();
+        chainList.add(signerCert);
+        try {
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            X509Certificate rootCert = (X509Certificate) cf.generateCertificate(
+                    new FileInputStream("/home/mouad/isicod-ca-cert.pem"));
+            chainList.add(rootCert);
+        } catch (Exception e) {}
+
+        X509Certificate[] chain = chainList.toArray(new X509Certificate[0]);
         Provider pkcs11Prov = Security.getProvider("SunPKCS11-SoftHSM");
 
         try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
             PDSignature sig = new PDSignature();
             sig.setFilter(PDSignature.FILTER_ADOBE_PPKLITE);
             sig.setSubFilter(PDSignature.SUBFILTER_ADBE_PKCS7_DETACHED);
-            sig.setName("Digital Signer");
-            sig.setReason("Document Signing");
-            sig.setSignDate(Calendar.getInstance());
+            sig.setName(SIGNER_NAME);
+            sig.setReason(SIGNER_REASON);
+            sig.setLocation(SIGNER_LOCATION);
+            sig.setSignDate(Calendar.getInstance()); // Set local time, TSA overrides
 
-            SignatureOptions opts = new SignatureOptions();
-            // No visible signature – digital signature only
-
-            doc.addSignature(sig, new Pkcs11Signer(pk, chain, pkcs11Prov), opts);
+            doc.addSignature(sig, new Pkcs11Signer(pk, chain, pkcs11Prov), new SignatureOptions());
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             doc.saveIncremental(out);
@@ -76,71 +91,92 @@ public class PdfSigningService {
         private final PrivateKey pk;
         private final X509Certificate[] chain;
         private final Provider pkcs11Prov;
+        private static final Logger log = LoggerFactory.getLogger(Pkcs11Signer.class);
 
         Pkcs11Signer(PrivateKey pk, X509Certificate[] chain, Provider pkcs11Prov) {
-            this.pk = pk;
-            this.chain = chain;
-            this.pkcs11Prov = pkcs11Prov;
+            this.pk = pk; this.chain = chain; this.pkcs11Prov = pkcs11Prov;
         }
 
         @Override
         public byte[] sign(InputStream content) throws IOException {
             try {
-                // 1. Let Bouncy Castle build a ContentSigner backed directly by your PKCS#11 Token
-                ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA")
-                        .setProvider(pkcs11Prov)
-                        .build(pk);
+                byte[] data = content.readAllBytes();
 
-                // 2. Initialize the CMS generator
+                // Sign with PKCS#11
+                ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA")
+                        .setProvider(pkcs11Prov).build(pk);
+
+                // Get TSA timestamp
+                byte[] timestampToken = getTimestampToken(data);
+
+                // Build CMS
                 CMSSignedDataGenerator gen = new CMSSignedDataGenerator();
                 gen.addSignerInfoGenerator(new JcaSignerInfoGeneratorBuilder(
                         new JcaDigestCalculatorProviderBuilder().setProvider("BC").build()
                 ).build(contentSigner, chain[0]));
-                
+
                 gen.addCertificates(new JcaCertStore(Arrays.asList(chain)));
 
-                // 3. Process the stream contents directly without allocating massive memory arrays
-                CMSProcessableInputStream msg = new CMSProcessableInputStream(content);
-                
-                // 4. Generate the detached signature block (encapsulate = false)
-                CMSSignedData signedData = gen.generate(msg, false);
+                CMSSignedData signedData = gen.generate(new CMSProcessableByteArray(data), false);
+
+                // If we have a timestamp, log it
+                if (timestampToken != null) {
+                    TimeStampResponse tsResponse = new TimeStampResponse(timestampToken);
+                    TimeStampToken tsToken = tsResponse.getTimeStampToken();
+                    log.info("Document timestamped at: {}", tsToken.getTimeStampInfo().getGenTime());
+                }
+
                 return signedData.getEncoded();
-                
             } catch (Exception e) {
-                log.error("Cryptographic signing processing failed", e);
+                log.error("Sign failed", e);
                 throw new IOException("Sign failed: " + e.getMessage(), e);
             }
         }
-    }
 
-    /**
-     * Efficient helper to pipe PDF byte ranges into BouncyCastle's hashing blocks
-     * without duplicating content ranges in memory.
-     */
-    private static class CMSProcessableInputStream implements CMSTypedData {
-        private final InputStream in;
+        private byte[] getTimestampToken(byte[] data) {
+            for (String tsaUrl : TSA_SERVERS) {
+                try {
+                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                    byte[] hash = digest.digest(data);
 
-        public CMSProcessableInputStream(InputStream in) {
-            this.in = in;
-        }
+                    TimeStampRequestGenerator reqGen = new TimeStampRequestGenerator();
+                    reqGen.setCertReq(true);
+                    TimeStampRequest request = reqGen.generate(
+                            new ASN1ObjectIdentifier("2.16.840.1.101.3.4.2.1"),
+                            hash, BigInteger.valueOf(100));
 
-        @Override
-        public ASN1ObjectIdentifier getContentType() {
-            return CMSObjectIdentifiers.data;
-        }
+                    byte[] requestBytes = request.getEncoded();
+                    URL url = new URL(tsaUrl);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setDoOutput(true);
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Content-Type", "application/timestamp-query");
+                    conn.setRequestProperty("Content-Length", String.valueOf(requestBytes.length));
+                    conn.setConnectTimeout(TSA_TIMEOUT_MS);
+                    conn.setReadTimeout(TSA_TIMEOUT_MS);
 
-        @Override
-        public void write(OutputStream out) throws IOException, CMSException {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                out.write(buffer, 0, read);
+                    try (OutputStream out = conn.getOutputStream()) {
+                        out.write(requestBytes); out.flush();
+                    }
+
+                    if (conn.getResponseCode() != 200) continue;
+
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    try (InputStream in = conn.getInputStream()) {
+                        byte[] buffer = new byte[4096]; int n;
+                        while ((n = in.read(buffer)) != -1) baos.write(buffer, 0, n);
+                    }
+
+                    TimeStampResponse response = new TimeStampResponse(baos.toByteArray());
+                    response.validate(request);
+                    if (response.getTimeStampToken() != null) {
+                        return baos.toByteArray();
+                    }
+                } catch (Exception e) {
+                    log.warn("TSA {} failed: {}", tsaUrl, e.getMessage());
+                }
             }
-        }
-
-        @Override
-        public Object getContent() {
-            return in;
+            return null;
         }
     }
 }

@@ -19,7 +19,7 @@ public class PdfSignerController {
     @GetMapping("/")
     public ResponseEntity<String> home() {
         String html = "<!DOCTYPE html><html><head><title>PDF Signer</title></head><body>" +
-            "<h1>PDF Digital Signature</h1>" +
+            "<h1>Sign your PDF</h1>" +
             "<form action='/sign' method='post' enctype='multipart/form-data'>" +
             "<input type='file' name='file' accept='.pdf' required><br><br>" +
             "<button type='submit'>Sign PDF</button>" +
@@ -30,16 +30,22 @@ public class PdfSignerController {
     @PostMapping("/sign")
     public ResponseEntity<?> sign(@RequestParam("file") MultipartFile file) {
         try {
-            log.info("Signing file: {}", file.getOriginalFilename());
+            log.info("Signing file: {} by Mouad", file.getOriginalFilename());
+            
+            // Call the signing service
             byte[] signed = signingService.signPdf(file.getBytes());
+            
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_PDF);
             headers.setContentDisposition(ContentDisposition.attachment()
                     .filename("signed_" + file.getOriginalFilename()).build());
+            
             return ResponseEntity.ok().headers(headers).body(signed);
+            
         } catch (Exception e) {
             log.error("Error: {}", e.getMessage(), e);
-            return ResponseEntity.internalServerError().body("{\"error\":\"" + e.getMessage() + "\"}");
+            return ResponseEntity.internalServerError()
+                    .body("{\"error\":\"" + e.getMessage() + "\"}");
         }
     }
 
