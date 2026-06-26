@@ -22,3 +22,51 @@ Thumbs.db
 application-prod.properties
 *.env
 pkcs11.cfg   # optional – uncomment if you want to exclude your local pkcs11.cfg
+
+# ==================== SECRETS & SENSITIVE FILES ====================
+# Never commit real credentials
+application-prod.properties
+application-secrets.properties
+*.env
+*.key
+*.p12
+*.jks
+
+# PKCS#11 config (contains slot number - may vary per machine)
+# src/main/resources/pkcs11.cfg   # Uncomment if slot changes per machine
+
+# Certificate private keys - NEVER COMMIT
+isicod-ca-key.pem
+isicod-root-key.pem
+isicod-intermediate-key.pem
+*-key.pem
+
+# Signed PDFs from testing
+/tmp/*.pdf
+
+# ==================== IDE FILES ====================
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==================== OS FILES ====================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==================== BUILD OUTPUTS ====================
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+
+# ==================== LOGS ====================
+*.log
+logs/
