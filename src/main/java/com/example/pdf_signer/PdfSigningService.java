@@ -4,8 +4,6 @@ import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.*;
 import org.bouncycastle.asn1.*;
-import org.bouncycastle.asn1.cms.Attribute;
-import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.cert.jcajce.JcaCertStore;
 import org.bouncycastle.cms.*;
 import org.bouncycastle.cms.jcajce.JcaSignerInfoGeneratorBuilder;
@@ -60,12 +58,21 @@ public class PdfSigningService {
 
         List<X509Certificate> chainList = new ArrayList<>();
         chainList.add(signerCert);
+
+        // Try Root CA from HSM first
         try {
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            X509Certificate rootCert = (X509Certificate) cf.generateCertificate(
-                    new FileInputStream("/home/mouad/isicod-ca-cert.pem"));
-            chainList.add(rootCert);
-        } catch (Exception e) {}
+            KeyStore rootStore = pkcs11Config.getRootCaKeyStore();
+            if (rootStore != null) {
+                String rootAlias = rootStore.aliases().nextElement();
+                X509Certificate rootCert = (X509Certificate) rootStore.getCertificate(rootAlias);
+                if (rootCert != null) {
+                    chainList.add(rootCert);
+                    log.info("Root CA from HSM: {}", rootCert.getSubjectX500Principal());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Root CA HSM: {}", e.getMessage());
+        }
 
         X509Certificate[] chain = chainList.toArray(new X509Certificate[0]);
         Provider pkcs11Prov = Security.getProvider("SunPKCS11-SoftHSM");
@@ -77,7 +84,7 @@ public class PdfSigningService {
             sig.setName(SIGNER_NAME);
             sig.setReason(SIGNER_REASON);
             sig.setLocation(SIGNER_LOCATION);
-            sig.setSignDate(Calendar.getInstance()); // Set local time, TSA overrides
+            sig.setSignDate(Calendar.getInstance());
 
             doc.addSignature(sig, new Pkcs11Signer(pk, chain, pkcs11Prov), new SignatureOptions());
 
@@ -101,82 +108,19 @@ public class PdfSigningService {
         public byte[] sign(InputStream content) throws IOException {
             try {
                 byte[] data = content.readAllBytes();
-
-                // Sign with PKCS#11
-                ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA")
+                ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA")
                         .setProvider(pkcs11Prov).build(pk);
 
-                // Get TSA timestamp
-                byte[] timestampToken = getTimestampToken(data);
-
-                // Build CMS
                 CMSSignedDataGenerator gen = new CMSSignedDataGenerator();
                 gen.addSignerInfoGenerator(new JcaSignerInfoGeneratorBuilder(
                         new JcaDigestCalculatorProviderBuilder().setProvider("BC").build()
-                ).build(contentSigner, chain[0]));
-
+                ).build(signer, chain[0]));
                 gen.addCertificates(new JcaCertStore(Arrays.asList(chain)));
 
-                CMSSignedData signedData = gen.generate(new CMSProcessableByteArray(data), false);
-
-                // If we have a timestamp, log it
-                if (timestampToken != null) {
-                    TimeStampResponse tsResponse = new TimeStampResponse(timestampToken);
-                    TimeStampToken tsToken = tsResponse.getTimeStampToken();
-                    log.info("Document timestamped at: {}", tsToken.getTimeStampInfo().getGenTime());
-                }
-
-                return signedData.getEncoded();
+                return gen.generate(new CMSProcessableByteArray(data), false).getEncoded();
             } catch (Exception e) {
-                log.error("Sign failed", e);
                 throw new IOException("Sign failed: " + e.getMessage(), e);
             }
-        }
-
-        private byte[] getTimestampToken(byte[] data) {
-            for (String tsaUrl : TSA_SERVERS) {
-                try {
-                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                    byte[] hash = digest.digest(data);
-
-                    TimeStampRequestGenerator reqGen = new TimeStampRequestGenerator();
-                    reqGen.setCertReq(true);
-                    TimeStampRequest request = reqGen.generate(
-                            new ASN1ObjectIdentifier("2.16.840.1.101.3.4.2.1"),
-                            hash, BigInteger.valueOf(100));
-
-                    byte[] requestBytes = request.getEncoded();
-                    URL url = new URL(tsaUrl);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setDoOutput(true);
-                    conn.setRequestMethod("POST");
-                    conn.setRequestProperty("Content-Type", "application/timestamp-query");
-                    conn.setRequestProperty("Content-Length", String.valueOf(requestBytes.length));
-                    conn.setConnectTimeout(TSA_TIMEOUT_MS);
-                    conn.setReadTimeout(TSA_TIMEOUT_MS);
-
-                    try (OutputStream out = conn.getOutputStream()) {
-                        out.write(requestBytes); out.flush();
-                    }
-
-                    if (conn.getResponseCode() != 200) continue;
-
-                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    try (InputStream in = conn.getInputStream()) {
-                        byte[] buffer = new byte[4096]; int n;
-                        while ((n = in.read(buffer)) != -1) baos.write(buffer, 0, n);
-                    }
-
-                    TimeStampResponse response = new TimeStampResponse(baos.toByteArray());
-                    response.validate(request);
-                    if (response.getTimeStampToken() != null) {
-                        return baos.toByteArray();
-                    }
-                } catch (Exception e) {
-                    log.warn("TSA {} failed: {}", tsaUrl, e.getMessage());
-                }
-            }
-            return null;
         }
     }
 }
